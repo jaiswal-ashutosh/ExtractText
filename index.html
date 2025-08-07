@@ -4,7 +4,7 @@
     <meta charset="UTF-8">
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
     <title>Hindi OCR - हिंदी टेक्स्ट एक्सट्रैक्टर</title>
-    <script src="https://cdnjs.cloudflare.com/ajax/libs/tesseract.js/4.1.1/tesseract.min.js"></script>
+    <script src="https://cdnjs.cloudflare.com/ajax/libs/tesseract.js/5.1.0/tesseract.min.js"></script>
     <style>
         * {
             margin: 0;
@@ -411,25 +411,51 @@
         let selectedLanguage = 'hin';
         let currentImage = null;
         let worker = null;
+        let isProcessing = false;
 
-        // Initialize Tesseract worker
+        // Initialize Tesseract worker with CDN workerPath
         async function initWorker() {
             if (!worker) {
                 try {
+                    console.log('Creating worker with CDN path...');
+                    
+                    // Use CDN paths to avoid blob security issues
                     worker = await Tesseract.createWorker('hin+eng', 1, {
+                        workerPath: 'https://cdnjs.cloudflare.com/ajax/libs/tesseract.js/5.1.0/worker.min.js',
+                        langPath: 'https://tessdata.projectnaptha.com/4.0.0_best/',
+                        corePath: 'https://cdnjs.cloudflare.com/ajax/libs/tesseract.js/5.1.0/tesseract-core-simd.wasm.js',
                         logger: m => {
-                            console.log('Tesseract:', m);
-                            if (m.status === 'loading tesseract core') {
-                                document.getElementById('statusText').textContent = 'Loading OCR engine...';
-                            } else if (m.status === 'initializing tesseract') {
-                                document.getElementById('statusText').textContent = 'Initializing...';
-                            }
+                            console.log('Tesseract log:', m);
+                            updateStatus(m);
                         }
                     });
+                    
+                    console.log('Worker initialized successfully');
+                    
                 } catch (error) {
-                    console.error('Worker initialization error:', error);
+                    console.error('Worker initialization failed:', error);
                     throw error;
                 }
+            }
+        }
+
+        function updateStatus(logMessage) {
+            const statusText = document.getElementById('statusText');
+            const progressFill = document.getElementById('progressFill');
+            
+            if (logMessage.status === 'recognizing text') {
+                const percentage = Math.round(logMessage.progress * 100);
+                progressFill.style.width = percentage + '%';
+                statusText.textContent = `Extracting text... ${percentage}%`;
+            } else if (logMessage.status) {
+                const statusMap = {
+                    'loading tesseract core': 'Loading OCR engine...',
+                    'initializing tesseract': 'Initializing OCR...',
+                    'loading language traineddata': 'Loading Hindi language data...',
+                    'initializing api': 'Setting up OCR...',
+                    'recognizing text': 'Extracting text...'
+                };
+                statusText.textContent = statusMap[logMessage.status] || logMessage.status;
             }
         }
 
@@ -488,7 +514,10 @@
         }
 
         async function extractText() {
-            if (!currentImage) return;
+            if (!currentImage || isProcessing) return;
+
+            console.log('Starting text extraction...');
+            isProcessing = true;
 
             const extractBtn = document.querySelector('#previewSection .upload-btn');
             const spinner = document.getElementById('loadingSpinner');
@@ -502,128 +531,61 @@
             spinner.style.display = 'inline-block';
             btnText.textContent = 'Processing...';
             progressSection.style.display = 'block';
-            statusText.textContent = 'Starting OCR...';
+            progressFill.style.width = '0%';
+            statusText.textContent = 'Initializing...';
 
             try {
-                // Initialize worker if not already done
+                // Initialize worker if needed
                 if (!worker) {
-                    statusText.textContent = 'Loading OCR engine (first time may take longer)...';
+                    statusText.textContent = 'Loading OCR engine (may take 30-60 seconds first time)...';
                     await initWorker();
                 }
 
-                // Convert image to canvas for better processing
-                const canvas = document.createElement('canvas');
-                const ctx = canvas.getContext('2d');
-                const img = new Image();
+                console.log('Running OCR with language:', selectedLanguage);
                 
-                await new Promise((resolve, reject) => {
-                    img.onload = resolve;
-                    img.onerror = reject;
-                    img.src = URL.createObjectURL(currentImage);
+                // Run OCR on the image
+                const { data: { text, confidence } } = await worker.recognize(currentImage, {
+                    lang: selectedLanguage
                 });
 
-                // Resize image if too large for better performance
-                const maxWidth = 1200;
-                const maxHeight = 1200;
-                let { width, height } = img;
-
-                if (width > maxWidth || height > maxHeight) {
-                    const ratio = Math.min(maxWidth / width, maxHeight / height);
-                    width *= ratio;
-                    height *= ratio;
-                }
-
-                canvas.width = width;
-                canvas.height = height;
-                ctx.drawImage(img, 0, 0, width, height);
-
-                // Enhance image for better OCR
-                const imageData = ctx.getImageData(0, 0, width, height);
-                enhanceImage(imageData);
-                ctx.putImageData(imageData, 0, 0);
-
-                // Convert canvas to blob
-                const blob = await new Promise(resolve => canvas.toBlob(resolve, 'image/png'));
-
-                statusText.textContent = 'Processing image...';
-                
-                // Set up progress tracking
-                const progressLogger = ({ status, progress }) => {
-                    console.log('OCR Progress:', status, progress);
-                    if (status === 'recognizing text') {
-                        const percentage = Math.round(progress * 100);
-                        progressFill.style.width = percentage + '%';
-                        statusText.textContent = `Extracting text... ${percentage}%`;
-                    } else if (status.includes('loading')) {
-                        statusText.textContent = 'Loading language data...';
-                    } else if (status.includes('initializing')) {
-                        statusText.textContent = 'Preparing OCR...';
-                    }
-                };
-
-                // Perform OCR with enhanced parameters
-                const { data: { text, confidence } } = await worker.recognize(blob, {
-                    logger: progressLogger
-                });
-
-                // Clean up
-                URL.revokeObjectURL(img.src);
+                console.log('OCR completed. Text length:', text.length, 'Confidence:', confidence);
 
                 // Display results
                 displayResults(text, confidence);
 
             } catch (error) {
                 console.error('OCR Error:', error);
-                let errorMsg = 'Error extracting text. ';
                 
-                if (error.message.includes('network')) {
-                    errorMsg += 'Please check your internet connection.';
-                } else if (error.message.includes('worker')) {
-                    errorMsg += 'OCR engine failed to load. Please refresh the page.';
+                let errorMsg = 'OCR failed. ';
+                if (error.message.includes('fetch') || error.message.includes('network')) {
+                    errorMsg += 'Network issue - please check internet connection.';
+                } else if (error.message.includes('SecurityError') || error.message.includes('Worker')) {
+                    errorMsg += 'Browser security restriction. Try downloading and running locally.';
                 } else {
-                    errorMsg += 'Please try with a different image or refresh the page.';
+                    errorMsg += error.message;
                 }
                 
                 showToast(errorMsg, 'error');
                 
                 // Reset worker on error
-                if (worker) {
-                    try {
+                try {
+                    if (worker) {
                         await worker.terminate();
                         worker = null;
-                    } catch (e) {
-                        console.error('Error terminating worker:', e);
                     }
+                } catch (e) {
+                    console.error('Error terminating worker:', e);
                 }
             } finally {
                 // Reset loading state
+                isProcessing = false;
                 extractBtn.disabled = false;
                 spinner.style.display = 'none';
                 btnText.textContent = 'Extract Text / टेक्स्ट निकालें';
-                progressSection.style.display = 'none';
-            }
-        }
-
-        // Image enhancement function for better OCR
-        function enhanceImage(imageData) {
-            const data = imageData.data;
-            
-            // Convert to grayscale and increase contrast
-            for (let i = 0; i < data.length; i += 4) {
-                // Calculate grayscale
-                const gray = Math.round(0.299 * data[i] + 0.587 * data[i + 1] + 0.114 * data[i + 2]);
-                
-                // Increase contrast
-                const contrast = 1.5;
-                const enhanced = Math.min(255, Math.max(0, (gray - 128) * contrast + 128));
-                
-                // Apply threshold for better text clarity
-                const threshold = enhanced > 128 ? 255 : 0;
-                
-                data[i] = threshold;     // Red
-                data[i + 1] = threshold; // Green  
-                data[i + 2] = threshold; // Blue
-                // Alpha channel remains unchanged
+                setTimeout(() => {
+                    progressSection.style.display = 'none';
+                }, 1000);
+                console.log('Extraction process completed');
             }
         }
 
@@ -708,17 +670,10 @@
             }, 3000);
         }
 
-        // Initialize on page load
-        window.addEventListener('load', async () => {
-            try {
-                // Pre-initialize worker for faster processing
-                showToast('Loading OCR engine...', 'info');
-                await initWorker();
-                showToast('OCR engine ready!', 'success');
-            } catch (error) {
-                console.error('Failed to initialize OCR:', error);
-                showToast('OCR engine failed to load. Please refresh the page.', 'error');
-            }
+        // Initialize on page load - simplified approach
+        window.addEventListener('load', () => {
+            console.log('Page loaded, OCR tool ready');
+            showToast('OCR tool ready! Upload an image to start.', 'info');
         });
 
         // Prevent default drag behaviors
