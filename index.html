@@ -415,9 +415,21 @@
         // Initialize Tesseract worker
         async function initWorker() {
             if (!worker) {
-                worker = await Tesseract.createWorker();
-                await worker.loadLanguage('hin+eng');
-                await worker.initialize('hin+eng');
+                try {
+                    worker = await Tesseract.createWorker('hin+eng', 1, {
+                        logger: m => {
+                            console.log('Tesseract:', m);
+                            if (m.status === 'loading tesseract core') {
+                                document.getElementById('statusText').textContent = 'Loading OCR engine...';
+                            } else if (m.status === 'initializing tesseract') {
+                                document.getElementById('statusText').textContent = 'Initializing...';
+                            }
+                        }
+                    });
+                } catch (error) {
+                    console.error('Worker initialization error:', error);
+                    throw error;
+                }
             }
         }
 
@@ -490,33 +502,99 @@
             spinner.style.display = 'inline-block';
             btnText.textContent = 'Processing...';
             progressSection.style.display = 'block';
+            statusText.textContent = 'Starting OCR...';
 
             try {
                 // Initialize worker if not already done
-                await initWorker();
+                if (!worker) {
+                    statusText.textContent = 'Loading OCR engine (first time may take longer)...';
+                    await initWorker();
+                }
 
+                // Convert image to canvas for better processing
+                const canvas = document.createElement('canvas');
+                const ctx = canvas.getContext('2d');
+                const img = new Image();
+                
+                await new Promise((resolve, reject) => {
+                    img.onload = resolve;
+                    img.onerror = reject;
+                    img.src = URL.createObjectURL(currentImage);
+                });
+
+                // Resize image if too large for better performance
+                const maxWidth = 1200;
+                const maxHeight = 1200;
+                let { width, height } = img;
+
+                if (width > maxWidth || height > maxHeight) {
+                    const ratio = Math.min(maxWidth / width, maxHeight / height);
+                    width *= ratio;
+                    height *= ratio;
+                }
+
+                canvas.width = width;
+                canvas.height = height;
+                ctx.drawImage(img, 0, 0, width, height);
+
+                // Enhance image for better OCR
+                const imageData = ctx.getImageData(0, 0, width, height);
+                enhanceImage(imageData);
+                ctx.putImageData(imageData, 0, 0);
+
+                // Convert canvas to blob
+                const blob = await new Promise(resolve => canvas.toBlob(resolve, 'image/png'));
+
+                statusText.textContent = 'Processing image...';
+                
                 // Set up progress tracking
-                worker.setLogger(({ status, progress }) => {
+                const progressLogger = ({ status, progress }) => {
+                    console.log('OCR Progress:', status, progress);
                     if (status === 'recognizing text') {
                         const percentage = Math.round(progress * 100);
                         progressFill.style.width = percentage + '%';
                         statusText.textContent = `Extracting text... ${percentage}%`;
-                    } else {
-                        statusText.textContent = status.charAt(0).toUpperCase() + status.slice(1) + '...';
+                    } else if (status.includes('loading')) {
+                        statusText.textContent = 'Loading language data...';
+                    } else if (status.includes('initializing')) {
+                        statusText.textContent = 'Preparing OCR...';
                     }
+                };
+
+                // Perform OCR with enhanced parameters
+                const { data: { text, confidence } } = await worker.recognize(blob, {
+                    logger: progressLogger
                 });
 
-                // Perform OCR
-                const { data: { text, confidence } } = await worker.recognize(currentImage, {
-                    lang: selectedLanguage
-                });
+                // Clean up
+                URL.revokeObjectURL(img.src);
 
                 // Display results
                 displayResults(text, confidence);
 
             } catch (error) {
                 console.error('OCR Error:', error);
-                showToast('Error extracting text. Please try again.', 'error');
+                let errorMsg = 'Error extracting text. ';
+                
+                if (error.message.includes('network')) {
+                    errorMsg += 'Please check your internet connection.';
+                } else if (error.message.includes('worker')) {
+                    errorMsg += 'OCR engine failed to load. Please refresh the page.';
+                } else {
+                    errorMsg += 'Please try with a different image or refresh the page.';
+                }
+                
+                showToast(errorMsg, 'error');
+                
+                // Reset worker on error
+                if (worker) {
+                    try {
+                        await worker.terminate();
+                        worker = null;
+                    } catch (e) {
+                        console.error('Error terminating worker:', e);
+                    }
+                }
             } finally {
                 // Reset loading state
                 extractBtn.disabled = false;
@@ -526,22 +604,57 @@
             }
         }
 
+        // Image enhancement function for better OCR
+        function enhanceImage(imageData) {
+            const data = imageData.data;
+            
+            // Convert to grayscale and increase contrast
+            for (let i = 0; i < data.length; i += 4) {
+                // Calculate grayscale
+                const gray = Math.round(0.299 * data[i] + 0.587 * data[i + 1] + 0.114 * data[i + 2]);
+                
+                // Increase contrast
+                const contrast = 1.5;
+                const enhanced = Math.min(255, Math.max(0, (gray - 128) * contrast + 128));
+                
+                // Apply threshold for better text clarity
+                const threshold = enhanced > 128 ? 255 : 0;
+                
+                data[i] = threshold;     // Red
+                data[i + 1] = threshold; // Green  
+                data[i + 2] = threshold; // Blue
+                // Alpha channel remains unchanged
+            }
+        }
+
         function displayResults(text, confidence) {
             const resultSection = document.getElementById('resultSection');
             const extractedText = document.getElementById('extractedText');
             const confidenceScore = document.getElementById('confidenceScore');
 
-            if (text.trim()) {
-                extractedText.textContent = text.trim();
+            // Clean and process the extracted text
+            const cleanedText = text.trim().replace(/\n\s*\n/g, '\n').replace(/^\s+|\s+$/gm, '');
+
+            if (cleanedText) {
+                extractedText.textContent = cleanedText;
                 confidenceScore.innerHTML = `
                     <strong>Confidence Score:</strong> ${Math.round(confidence)}%
                     <br><strong>Language:</strong> ${selectedLanguage === 'hin' ? 'Hindi' : selectedLanguage === 'eng' ? 'English' : 'Hindi + English'}
-                    <br><strong>Characters:</strong> ${text.trim().length}
+                    <br><strong>Characters:</strong> ${cleanedText.length}
+                    <br><strong>Words:</strong> ${cleanedText.split(/\s+/).filter(word => word.length > 0).length}
                 `;
                 resultSection.style.display = 'block';
-                showToast('Text extracted successfully!', 'success');
+                
+                // Scroll to results
+                resultSection.scrollIntoView({ behavior: 'smooth', block: 'start' });
+                
+                if (confidence > 70) {
+                    showToast('Text extracted successfully!', 'success');
+                } else {
+                    showToast('Text extracted with low confidence. Image quality may be poor.', 'warning');
+                }
             } else {
-                showToast('No text found in the image. Please try with a clearer image.', 'warning');
+                showToast('No text found. Please try with a clearer image with visible text.', 'warning');
             }
         }
 
@@ -596,8 +709,16 @@
         }
 
         // Initialize on page load
-        window.addEventListener('load', () => {
-            initWorker().catch(console.error);
+        window.addEventListener('load', async () => {
+            try {
+                // Pre-initialize worker for faster processing
+                showToast('Loading OCR engine...', 'info');
+                await initWorker();
+                showToast('OCR engine ready!', 'success');
+            } catch (error) {
+                console.error('Failed to initialize OCR:', error);
+                showToast('OCR engine failed to load. Please refresh the page.', 'error');
+            }
         });
 
         // Prevent default drag behaviors
